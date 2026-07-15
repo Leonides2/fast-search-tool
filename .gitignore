@@ -1,0 +1,17 @@
+
+__pycache__
+
+# Ignorar archivos de entornos virtuales de Python
+.env/
+venv/
+
+# Ignorar archivos de configuración de IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*.pyc
+
+# Ignorar archivos de sistema y logs
+*.log
+*.csv
