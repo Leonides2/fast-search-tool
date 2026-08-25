@@ -3,6 +3,7 @@
 import os
 import re
 import csv
+import sys
 import time
 import argparse
 import threading
@@ -10,11 +11,22 @@ import queue
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
+# Forzar salida UTF-8 en consola para evitar caracteres corruptos (mojibake)
+# en terminales que no usan UTF-8 por defecto (p. ej. cmd.exe con code page legado).
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
+# Límite razonable de hilos, para evitar agotar los recursos del sistema
+# si el usuario indica un valor absurdamente alto con --threads.
+MAX_THREADS = 256
+
 # Variables globales para recopilar resultados, errores y estadísticas
 results = []
 errors = []
 lock = threading.Lock()
-stats = {"files": 0, "dirs": 0}
+stats = {"files": 0, "dirs": 0, "symlinks": 0}
 
 def match(name, args):
     """
@@ -59,6 +71,12 @@ def worker(q, args, pbar):
             if match(filename, args):
                 with lock:
                     results.append(item)
+        except Exception as ex:
+            # Si match() falla (p. ej. un patrón --regex inválido), no dejamos morir
+            # el hilo: un worker de menos respecto a los sentinelas enviados provoca
+            # un cuelgue permanente en q.join(). Se registra el error y se continúa.
+            with lock:
+                errors.append(f"Error procesando archivo {item}: {ex}")
         finally:
             with lock:
                 stats["files"] += 1
@@ -82,6 +100,14 @@ def walk(root, q, args):
                 stats["dirs"] += 1
                 for entry in it:
                     try:
+                        # Los symlinks se omiten deliberadamente (a archivo o a carpeta): seguirlos
+                        # podría provocar un recorrido infinito si hay un enlace circular (una carpeta
+                        # que se enlaza a sí misma o a un ancestro), colgando el programa o agotando
+                        # memoria de forma indefinida. Se cuentan para que quede constancia en el log.
+                        if entry.is_symlink():
+                            stats["symlinks"] += 1
+                            continue
+
                         # Si es un directorio y no está excluido, se añade al stack para explorarlo
                         if entry.is_dir(follow_symlinks=False):
                             if entry.name in excl:
@@ -107,11 +133,13 @@ def main():
     ap = argparse.ArgumentParser(description="Herramienta rápida de búsqueda de archivos en Python con hilos concurrentes.")
     ap.add_argument("directory", help="Directorio raíz para iniciar la búsqueda.")
     ap.add_argument("pattern", help="Patrón o texto a buscar en el nombre de los archivos.")
-    ap.add_argument("-t", "--threads", type=int, default=os.cpu_count() * 4,
-                    help="Número de hilos trabajadores (por defecto: CPU_COUNT * 4).")
-    ap.add_argument("--exact", action="store_true", help="El nombre debe coincidir exactamente.")
-    ap.add_argument("--contains", action="store_true", help="El nombre debe contener el patrón en cualquier posición.")
-    ap.add_argument("--regex", action="store_true", help="El patrón se interpreta como una expresión regular.")
+    ap.add_argument("-t", "--threads", type=int, default=(os.cpu_count() or 4) * 4,
+                    help=f"Número de hilos trabajadores (por defecto: CPU_COUNT * 4, máximo {MAX_THREADS}).")
+    # Mutuamente excluyentes: solo uno de estos modos de coincidencia puede usarse a la vez.
+    modo = ap.add_mutually_exclusive_group()
+    modo.add_argument("--exact", action="store_true", help="El nombre debe coincidir exactamente.")
+    modo.add_argument("--contains", action="store_true", help="El nombre debe contener el patrón en cualquier posición.")
+    modo.add_argument("--regex", action="store_true", help="El patrón se interpreta como una expresión regular.")
     ap.add_argument("-c", "--case-sensitive", action="store_true", help="Búsqueda sensible a mayúsculas y minúsculas.")
     ap.add_argument("--exclude", help="Lista de carpetas a excluir, separadas por comas.")
     ap.add_argument("--ext", nargs="*", help="Lista de extensiones de archivo permitidas (ej. txt py csv).")
@@ -120,6 +148,14 @@ def main():
     ap.add_argument("--oldest-first", action="store_true",
                     help="Ordena los resultados del más antiguo al más reciente (por defecto: del más reciente al más antiguo).")
     args = ap.parse_args()
+
+    # Validar número de hilos: evitar valores inválidos o excesivos que agoten
+    # los recursos del sistema (creación masiva de hilos del SO).
+    if args.threads < 1:
+        ap.error("--threads/-t debe ser al menos 1.")
+    if args.threads > MAX_THREADS:
+        print(f"Aviso: --threads={args.threads} es demasiado alto; se limita a {MAX_THREADS}.")
+        args.threads = MAX_THREADS
 
     # Inicializar la cola de archivos con un límite para controlar el uso de memoria
     q = queue.Queue(maxsize=5000)
@@ -134,13 +170,19 @@ def main():
         for _ in range(args.threads):
             executor.submit(worker, q, args, pbar)
         
-        # Iniciar el recorrido de carpetas para llenar la cola
-        walk(args.directory, q, args)
-        
-        # Enviar señal de fin (None) a cada hilo trabajador para que terminen ordenadamente
-        for _ in range(args.threads):
-            q.put(None)
-        
+        try:
+            # Iniciar el recorrido de carpetas para llenar la cola
+            walk(args.directory, q, args)
+        except Exception as ex:
+            # Si el recorrido falla de forma inesperada, igual hay que enviar los
+            # sentinelas en el finally: si no, los workers quedan bloqueados en
+            # q.get() para siempre y el programa se cuelga.
+            errors.append(f"Error fatal durante el recorrido de directorios: {ex}")
+        finally:
+            # Enviar señal de fin (None) a cada hilo trabajador para que terminen ordenadamente
+            for _ in range(args.threads):
+                q.put(None)
+
         # Esperar a que todos los elementos de la cola se hayan procesado por completo
         q.join()
         
@@ -167,6 +209,7 @@ def main():
     with open(args.log, "w", encoding="utf8") as f:
         f.write(f"Archivos procesados: {stats['files']}\n")
         f.write(f"Directorios recorridos: {stats['dirs']}\n")
+        f.write(f"Symlinks omitidos (no se siguen): {stats['symlinks']}\n")
         f.write(f"Coincidencias encontradas: {len(results)}\n")
         f.write(f"Tiempo de ejecución: {elapsed_time:.2f}s\n\n")
         
