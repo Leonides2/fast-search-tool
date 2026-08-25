@@ -15,9 +15,10 @@ import sys
 import json
 import queue
 import threading
+from pathlib import Path
 
 import customtkinter as ctk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, ttk, PhotoImage
 
 from search_core import SearchOptions, run_search, format_time, MAX_THREADS
 
@@ -78,6 +79,7 @@ class App(ctk.CTk):
         self.title("Buscador de Archivos")
         self.geometry("1000x760")
         self.minsize(820, 600)
+        self._set_window_icon()
 
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
@@ -107,6 +109,20 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
     # ------------------------------------------------------------------ UI
+
+    def _set_window_icon(self):
+        # sys.argv[0] apunta a gui.py cuando corre desde fuente, y al .exe
+        # cuando corre ya compilado con Nuitka — en ambos casos icon.png
+        # vive junto a él (build.py se encarga de copiarlo al lado del .exe).
+        icon_path = Path(sys.argv[0]).resolve().parent / "icon.png"
+        try:
+            # Hay que guardar la referencia en la instancia: si el objeto
+            # PhotoImage se recolecta como basura, Tkinter borra la imagen
+            # subyacente y el ícono desaparece poco después de asignarlo.
+            self._icon_image = PhotoImage(file=str(icon_path))
+            self.iconphoto(True, self._icon_image)
+        except Exception:
+            pass  # cosmético: si falta el archivo o falla la carga, seguimos sin ícono
 
     def _build_form(self, cfg: dict):
         frame = ctk.CTkFrame(self)

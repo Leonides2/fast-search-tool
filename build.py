@@ -33,6 +33,8 @@ import sys
 APP_NAME = "BuscarArchivos"
 BUILD_DIR = "build"
 DIST_DIR = "dist"
+ICON_PNG = "icon.png"  # ícono de la ventana en tiempo de ejecución (gui.py -> iconphoto)
+ICON_ICO = "icon.ico"  # ícono del propio .exe en Windows (Explorador, taskbar, acceso directo)
 
 
 def _win_version(v: str) -> str:
@@ -69,10 +71,22 @@ def main() -> None:
             f"--file-version={_win_version(version)}",
             f"--product-version={_win_version(version)}",
         ]
+        if os.path.isfile(ICON_ICO):
+            cmd.append(f"--windows-icon-from-ico={ICON_ICO}")
+        else:
+            print(f"Aviso: no se encontró {ICON_ICO}; el .exe quedará con el ícono genérico.")
     else:
         # Linux/macOS: binario standalone simple (sin bundle .app en macOS)
         # para mantener un único camino de empaquetado en los tres SO.
         cmd += [f"--output-filename={APP_NAME}"]
+
+    # El ícono de ventana (iconphoto en gui.py) se busca en tiempo de
+    # ejecución junto al ejecutable — hay que copiarlo al dist explícitamente,
+    # Nuitka no lo detecta solo porque no es un import ni un package data.
+    if os.path.isfile(ICON_PNG):
+        cmd.append(f"--include-data-files={ICON_PNG}={ICON_PNG}")
+    else:
+        print(f"Aviso: no se encontró {ICON_PNG}; la ventana quedará sin ícono propio.")
 
     cmd.append("gui.py")
 
