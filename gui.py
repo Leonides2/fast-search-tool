@@ -15,13 +15,11 @@ import sys
 import json
 import queue
 import threading
-import subprocess
-from dataclasses import asdict
 
 import customtkinter as ctk
 from tkinter import filedialog, messagebox, ttk
 
-from search_core import SearchOptions, run_search, write_log, write_csv, MAX_THREADS
+from search_core import SearchOptions, run_search, format_time, MAX_THREADS
 
 # Forzar salida UTF-8 en consola (por si se lanza desde una terminal) para
 # evitar caracteres corruptos en los prints de diagnóstico.
@@ -30,14 +28,28 @@ try:
 except Exception:
     pass
 
-# Límite de filas que se pintan en la tabla de resultados. Insertar decenas
-# de miles de filas en el Treeview de golpe puede congelar la ventana unos
-# segundos; el CSV/log de salida siempre contiene el listado completo, sin
-# este límite.
-MAX_DISPLAYED_ROWS = 5000
+# Límite de seguridad para la tabla de resultados: los resultados se insertan
+# en lotes (self.after) para no congelar la ventana, pero por encima de este
+# número el propio widget Treeview empieza a ir lento sin importar cómo se
+# llene, así que se trunca la vista (no la búsqueda) a partir de aquí.
+MAX_DISPLAYED_ROWS = 50000
+_ROW_BATCH_SIZE = 300
 
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "BuscarArchivos")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
+
+# Extensiones agrupadas por categoría para el menú de filtros. La clave es lo
+# que se muestra en el checkbox; el valor, las extensiones reales que cubre.
+EXTENSION_GROUPS = {
+    "PDF": ["pdf"],
+    "Word": ["doc", "docx"],
+    "Excel": ["xls", "xlsx"],
+    "PowerPoint": ["ppt", "pptx"],
+    "Imágenes": ["jpg", "jpeg", "png", "gif", "bmp"],
+    "Comprimidos": ["zip", "rar", "7z"],
+    "Texto": ["txt"],
+    "Video": ["mp4", "avi", "mkv", "mov"],
+}
 
 
 def load_config() -> dict:
@@ -64,8 +76,8 @@ class App(ctk.CTk):
         super().__init__()
 
         self.title("Buscador de Archivos")
-        self.geometry("980x680")
-        self.minsize(760, 520)
+        self.geometry("1000x760")
+        self.minsize(820, 600)
 
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
@@ -77,12 +89,20 @@ class App(ctk.CTk):
         self._progress_files = 0
         self._progress_dirs = 0
         self._last_matches: list[tuple[str, float]] = []
+        self._last_errors: list[str] = []
+        self._advanced_visible = False
+        self._applied_theme_mode = None
 
         cfg = load_config()
         self._build_form(cfg)
+        self._build_advanced(cfg)
         self._build_actions()
         self._build_progress()
         self._build_results()
+
+        self._update_target_dependent_ui()
+        self._apply_treeview_theme()
+        self._watch_theme()
 
         self.protocol("WM_DELETE_WINDOW", self._on_closing)
 
@@ -109,8 +129,62 @@ class App(ctk.CTk):
         self.pattern_entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=8, pady=6)
 
         row += 1
-        ctk.CTkLabel(frame, text="Modo").grid(row=row, column=0, sticky="w", padx=8, pady=6)
-        modos_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        ctk.CTkLabel(frame, text="Buscar").grid(row=row, column=0, sticky="w", padx=8, pady=6)
+        target_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        target_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=4, pady=2)
+        self.target_var = ctk.StringVar(value=cfg.get("target", "files"))
+        ctk.CTkRadioButton(
+            target_frame, text="Archivos", variable=self.target_var, value="files",
+            command=self._update_target_dependent_ui,
+        ).pack(side="left", padx=6)
+        ctk.CTkRadioButton(
+            target_frame, text="Carpetas", variable=self.target_var, value="dirs",
+            command=self._update_target_dependent_ui,
+        ).pack(side="left", padx=6)
+
+        row += 1
+        self.ext_label = ctk.CTkLabel(frame, text="Extensiones")
+        self.ext_label.grid(row=row, column=0, sticky="nw", padx=8, pady=6)
+        self.ext_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        self.ext_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=4, pady=2)
+
+        saved_groups = set(cfg.get("ext_groups", []))
+        self.ext_group_vars: dict[str, ctk.BooleanVar] = {}
+        cols = 4
+        for i, group in enumerate(EXTENSION_GROUPS):
+            var = ctk.BooleanVar(value=group in saved_groups)
+            self.ext_group_vars[group] = var
+            cb = ctk.CTkCheckBox(self.ext_frame, text=group, variable=var)
+            cb.grid(row=i // cols, column=i % cols, sticky="w", padx=6, pady=3)
+
+        extra_row = (len(EXTENSION_GROUPS) - 1) // cols + 1
+        self.ext_other_var = ctk.BooleanVar(value=cfg.get("ext_other_enabled", False))
+        self.ext_other_check = ctk.CTkCheckBox(
+            self.ext_frame, text="Otras", variable=self.ext_other_var, command=self._update_ext_other_state
+        )
+        self.ext_other_check.grid(row=extra_row, column=0, sticky="w", padx=6, pady=(6, 3))
+        self.ext_other_entry = ctk.CTkEntry(
+            self.ext_frame, placeholder_text="ej. log json xml", width=260
+        )
+        self.ext_other_entry.insert(0, cfg.get("ext_other", ""))
+        self.ext_other_entry.grid(row=extra_row, column=1, columnspan=3, sticky="w", padx=6, pady=(6, 3))
+        self._update_ext_other_state()
+
+    def _build_advanced(self, cfg: dict):
+        self.advanced_toggle = ctk.CTkButton(
+            self, text="▸ Opciones avanzadas", anchor="w", fg_color="transparent",
+            text_color=("gray10", "gray90"), hover_color=("gray85", "gray25"),
+            command=self._toggle_advanced,
+        )
+        self.advanced_toggle.pack(fill="x", padx=12, pady=(0, 2))
+
+        self.advanced_frame = ctk.CTkFrame(self)
+        self.advanced_frame.grid_columnconfigure(1, weight=1)
+        # No se hace pack() todavía: arranca oculto (ver _toggle_advanced).
+
+        row = 0
+        ctk.CTkLabel(self.advanced_frame, text="Modo").grid(row=row, column=0, sticky="w", padx=8, pady=6)
+        modos_frame = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
         modos_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=4, pady=2)
         self.mode_var = ctk.StringVar(value=cfg.get("mode", "startswith"))
         for texto, valor in [
@@ -124,7 +198,7 @@ class App(ctk.CTk):
             )
 
         row += 1
-        opts_frame = ctk.CTkFrame(frame, fg_color="transparent")
+        opts_frame = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
         opts_frame.grid(row=row, column=0, columnspan=3, sticky="w", padx=4, pady=2)
         self.case_var = ctk.BooleanVar(value=cfg.get("case_sensitive", False))
         ctk.CTkCheckBox(opts_frame, text="Sensible a mayúsculas", variable=self.case_var).pack(
@@ -136,41 +210,35 @@ class App(ctk.CTk):
         )
 
         row += 1
-        ctk.CTkLabel(frame, text="Excluir carpetas").grid(row=row, column=0, sticky="w", padx=8, pady=6)
-        self.exclude_entry = ctk.CTkEntry(frame, placeholder_text="carpeta1, carpeta2, ...")
+        ctk.CTkLabel(self.advanced_frame, text="Excluir carpetas").grid(
+            row=row, column=0, sticky="w", padx=8, pady=6
+        )
+        self.exclude_entry = ctk.CTkEntry(self.advanced_frame, placeholder_text="carpeta1, carpeta2, ...")
         self.exclude_entry.insert(0, cfg.get("exclude", ""))
         self.exclude_entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=8, pady=6)
 
         row += 1
-        ctk.CTkLabel(frame, text="Extensiones").grid(row=row, column=0, sticky="w", padx=8, pady=6)
-        self.ext_entry = ctk.CTkEntry(frame, placeholder_text="txt py csv (vacío = todas)")
-        self.ext_entry.insert(0, cfg.get("ext", ""))
-        self.ext_entry.grid(row=row, column=1, columnspan=2, sticky="ew", padx=8, pady=6)
-
-        row += 1
-        ctk.CTkLabel(frame, text="Hilos").grid(row=row, column=0, sticky="w", padx=8, pady=6)
         default_threads = (os.cpu_count() or 4) * 4
-        self.threads_entry = ctk.CTkEntry(frame, width=100)
+        ctk.CTkLabel(self.advanced_frame, text="Hilos").grid(row=row, column=0, sticky="w", padx=8, pady=6)
+        threads_frame = ctk.CTkFrame(self.advanced_frame, fg_color="transparent")
+        threads_frame.grid(row=row, column=1, columnspan=2, sticky="w", padx=4, pady=2)
+        self.threads_entry = ctk.CTkEntry(threads_frame, width=100)
         self.threads_entry.insert(0, str(cfg.get("threads", default_threads)))
-        self.threads_entry.grid(row=row, column=1, sticky="w", padx=8, pady=6)
+        self.threads_entry.pack(side="left")
+        ctk.CTkLabel(
+            threads_frame,
+            text=f"(automático según CPU: {default_threads}; ajusta solo si lo necesitas)",
+            text_color=("gray40", "gray60"),
+        ).pack(side="left", padx=10)
 
-        row += 1
-        ctk.CTkLabel(frame, text="Salida CSV").grid(row=row, column=0, sticky="w", padx=8, pady=6)
-        self.csv_entry = ctk.CTkEntry(frame)
-        self.csv_entry.insert(0, cfg.get("csv", "resultados.csv"))
-        self.csv_entry.grid(row=row, column=1, sticky="ew", padx=8, pady=6)
-        ctk.CTkButton(frame, text="Guardar como...", width=100, command=self._browse_csv).grid(
-            row=row, column=2, padx=8, pady=6
-        )
-
-        row += 1
-        ctk.CTkLabel(frame, text="Salida Log").grid(row=row, column=0, sticky="w", padx=8, pady=6)
-        self.log_entry = ctk.CTkEntry(frame)
-        self.log_entry.insert(0, cfg.get("log", "resultados.log"))
-        self.log_entry.grid(row=row, column=1, sticky="ew", padx=8, pady=6)
-        ctk.CTkButton(frame, text="Guardar como...", width=100, command=self._browse_log).grid(
-            row=row, column=2, padx=8, pady=6
-        )
+    def _toggle_advanced(self):
+        self._advanced_visible = not self._advanced_visible
+        if self._advanced_visible:
+            self.advanced_toggle.configure(text="▾ Opciones avanzadas")
+            self.advanced_frame.pack(fill="x", padx=12, pady=(0, 6), after=self.advanced_toggle)
+        else:
+            self.advanced_toggle.configure(text="▸ Opciones avanzadas")
+            self.advanced_frame.pack_forget()
 
     def _build_actions(self):
         frame = ctk.CTkFrame(self, fg_color="transparent")
@@ -219,12 +287,59 @@ class App(ctk.CTk):
 
         actions = ctk.CTkFrame(self, fg_color="transparent")
         actions.pack(fill="x", padx=12, pady=(0, 12))
-        ctk.CTkButton(actions, text="Abrir carpeta contenedora", command=self._open_containing_folder).pack(
+        ctk.CTkButton(actions, text="Abrir en el explorador", command=self._open_containing_folder).pack(
             side="left", padx=(0, 8)
         )
         ctk.CTkButton(actions, text="Copiar ruta", command=self._copy_path).pack(side="left", padx=(0, 8))
+        self.errors_button = ctk.CTkButton(
+            actions, text="Ver errores", command=self._show_errors, state="disabled", width=100,
+            fg_color="#a13d3d", hover_color="#832f2f",
+        )
+        self.errors_button.pack(side="left", padx=(0, 8))
         self.errors_label = ctk.CTkLabel(actions, text="")
-        self.errors_label.pack(side="left", padx=16)
+        self.errors_label.pack(side="left", padx=8)
+
+    # -------------------------------------------------------- tema (dark/light)
+
+    def _apply_treeview_theme(self):
+        mode = ctk.get_appearance_mode()  # "Light" o "Dark"
+        if mode == self._applied_theme_mode:
+            return
+        self._applied_theme_mode = mode
+
+        style = ttk.Style()
+        style.theme_use("clam")  # los temas nativos de Windows ignoran los colores custom
+
+        if mode == "Dark":
+            bg, fg = "#2b2b2b", "#dce4ee"
+            heading_bg, heading_fg = "#212121", "#dce4ee"
+            selected_bg, selected_fg = "#1f6aa5", "#ffffff"
+            trough, arrow = "#212121", "#dce4ee"
+        else:
+            bg, fg = "#ffffff", "#1a1a1a"
+            heading_bg, heading_fg = "#e8e8e8", "#1a1a1a"
+            selected_bg, selected_fg = "#3b8ed0", "#ffffff"
+            trough, arrow = "#e8e8e8", "#1a1a1a"
+
+        style.configure(
+            "Treeview", background=bg, fieldbackground=bg, foreground=fg,
+            bordercolor=bg, borderwidth=0, rowheight=24,
+        )
+        style.map("Treeview", background=[("selected", selected_bg)], foreground=[("selected", selected_fg)])
+        style.configure("Treeview.Heading", background=heading_bg, foreground=heading_fg, relief="flat")
+        style.map("Treeview.Heading", background=[("active", heading_bg)])
+        style.configure(
+            "Vertical.TScrollbar", background=heading_bg, troughcolor=trough,
+            bordercolor=bg, arrowcolor=arrow,
+        )
+
+    def _watch_theme(self):
+        # CustomTkinter no siempre notifica cuando el tema del SO cambia en
+        # caliente; comprobar cada par de segundos es barato y garantiza que
+        # la tabla de resultados (que es un widget ttk aparte) se mantenga
+        # sincronizada con el modo claro/oscuro del sistema.
+        self._apply_treeview_theme()
+        self.after(2000, self._watch_theme)
 
     # ------------------------------------------------------------- eventos
 
@@ -234,21 +349,32 @@ class App(ctk.CTk):
             self.dir_entry.delete(0, "end")
             self.dir_entry.insert(0, path)
 
-    def _browse_csv(self):
-        path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if path:
-            self.csv_entry.delete(0, "end")
-            self.csv_entry.insert(0, path)
+    def _update_target_dependent_ui(self):
+        is_files = self.target_var.get() == "files"
+        state = "normal" if is_files else "disabled"
+        for widget in self.ext_frame.winfo_children():
+            widget.configure(state=state)
+        if is_files:
+            self._update_ext_other_state()
+        self.ext_label.configure(text_color=("gray10", "gray90") if is_files else ("gray50", "gray50"))
 
-    def _browse_log(self):
-        path = filedialog.asksaveasfilename(defaultextension=".log", filetypes=[("Log", "*.log")])
-        if path:
-            self.log_entry.delete(0, "end")
-            self.log_entry.insert(0, path)
+    def _update_ext_other_state(self):
+        self.ext_other_entry.configure(state="normal" if self.ext_other_var.get() else "disabled")
+
+    def _selected_extensions(self) -> list[str] | None:
+        if self.target_var.get() != "files":
+            return None
+        ext: list[str] = []
+        for group, var in self.ext_group_vars.items():
+            if var.get():
+                ext.extend(EXTENSION_GROUPS[group])
+        if self.ext_other_var.get():
+            extra = self.ext_other_entry.get().strip()
+            if extra:
+                ext.extend(x.strip().lstrip(".").lower() for x in extra.replace(",", " ").split())
+        return ext or None
 
     def _current_options(self) -> SearchOptions:
-        ext_raw = self.ext_entry.get().strip()
-        ext = ext_raw.split() if ext_raw else None
         try:
             threads = int(self.threads_entry.get().strip())
         except ValueError:
@@ -264,8 +390,9 @@ class App(ctk.CTk):
             regex=(mode == "regex"),
             case_sensitive=self.case_var.get(),
             exclude=self.exclude_entry.get().strip() or None,
-            ext=ext,
+            ext=self._selected_extensions(),
             oldest_first=self.oldest_var.get(),
+            target=self.target_var.get(),
         )
 
     def _on_run(self):
@@ -279,13 +406,12 @@ class App(ctk.CTk):
             messagebox.showerror("Opciones inválidas", str(ex))
             return
 
-        csv_path = self.csv_entry.get().strip() or "resultados.csv"
-        log_path = self.log_entry.get().strip() or "resultados.log"
-
         # Limpiar resultados de la ejecución anterior antes de arrancar.
         self.tree.delete(*self.tree.get_children())
         self.errors_label.configure(text="")
+        self.errors_button.configure(state="disabled")
         self._last_matches = []
+        self._last_errors = []
         self._progress_files = 0
         self._progress_dirs = 0
 
@@ -304,9 +430,9 @@ class App(ctk.CTk):
         def worker():
             try:
                 result = run_search(opts, progress_cb=progress_cb, cancel_event=self.cancel_event)
-                self.event_queue.put(("done", result, csv_path, log_path))
+                self.event_queue.put(("done", result))
             except Exception as ex:
-                self.event_queue.put(("error", ex, csv_path, log_path))
+                self.event_queue.put(("error", ex))
 
         self.search_thread = threading.Thread(target=worker, daemon=True)
         self.search_thread.start()
@@ -321,10 +447,11 @@ class App(ctk.CTk):
 
     def _poll(self):
         # Actualiza la barra/label de progreso con los últimos contadores
-        # (sondeo periódico: la búsqueda puede procesar miles de archivos
+        # (sondeo periódico: la búsqueda puede procesar miles de elementos
         # por segundo, pero la ventana solo se repinta aquí, ~6-7 veces/seg).
+        etiqueta = "Archivos" if self.target_var.get() == "files" else "Carpetas"
         self.progress_label.configure(
-            text=f"Archivos procesados: {self._progress_files}  |  Directorios recorridos: {self._progress_dirs}"
+            text=f"{etiqueta} analizados: {self._progress_files}  |  Directorios recorridos: {self._progress_dirs}"
         )
 
         try:
@@ -334,43 +461,50 @@ class App(ctk.CTk):
                 self.after(150, self._poll)
             return
 
-        kind = msg[0]
+        kind, payload = msg
         if kind == "done":
-            _, result, csv_path, log_path = msg
-            self._on_search_done(result, csv_path, log_path)
+            self._on_search_done(payload)
         elif kind == "error":
-            _, ex, csv_path, log_path = msg
-            self._on_search_error(ex)
+            self._on_search_error(payload)
 
-    def _on_search_done(self, result, csv_path, log_path):
+    def _on_search_done(self, result):
         self.progress_bar.stop()
         self.run_button.configure(state="normal")
         self.cancel_button.configure(state="disabled")
 
-        try:
-            write_log(log_path, result)
-            write_csv(csv_path, result)
-        except Exception as ex:
-            messagebox.showwarning("No se pudo escribir la salida", str(ex))
-
         self._last_matches = result.matches
-        for path, mtime in result.matches[:MAX_DISPLAYED_ROWS]:
-            from search_core import format_time
-            self.tree.insert("", "end", values=(path, format_time(mtime)))
+        self._last_errors = result.errors
+
+        truncated = len(result.matches) > MAX_DISPLAYED_ROWS
+        to_show = result.matches[:MAX_DISPLAYED_ROWS]
+        self._populate_results_batched(to_show)
 
         estado = "Cancelada" if result.cancelled else "Completada"
         self.status_label.configure(
             text=f"{estado} en {result.elapsed:.2f}s — {len(result.matches)} coincidencias."
         )
-        if len(result.matches) > MAX_DISPLAYED_ROWS:
+        if truncated:
             self.progress_label.configure(
                 text=self.progress_label.cget("text")
-                + f"  (mostrando los primeros {MAX_DISPLAYED_ROWS} de {len(result.matches)}; ver CSV/log completo)"
+                + f"  (mostrando los primeros {MAX_DISPLAYED_ROWS} de {len(result.matches)}; afina la búsqueda para acotar)"
             )
         if result.errors:
-            self.errors_label.configure(text=f"⚠ {len(result.errors)} error(es) — ver {log_path}")
+            self.errors_label.configure(text=f"⚠ {len(result.errors)} error(es) durante la búsqueda")
+            self.errors_button.configure(state="normal")
         else:
             self.errors_label.configure(text="")
+            self.errors_button.configure(state="disabled")
+
+    def _populate_results_batched(self, matches, index=0):
+        # Inserta en lotes vía self.after() en vez de todo de golpe: con miles
+        # de coincidencias, un solo bucle de insert() puede congelar la
+        # ventana perceptiblemente. Repartido en lotes, la ventana sigue
+        # respondiendo (se puede hasta scrollear) mientras se termina de llenar.
+        end = min(index + _ROW_BATCH_SIZE, len(matches))
+        for path, mtime in matches[index:end]:
+            self.tree.insert("", "end", values=(path, format_time(mtime)))
+        if end < len(matches):
+            self.after(1, lambda: self._populate_results_batched(matches, end))
 
     def _on_search_error(self, ex: Exception):
         self.progress_bar.stop()
@@ -378,6 +512,19 @@ class App(ctk.CTk):
         self.cancel_button.configure(state="disabled")
         self.status_label.configure(text="Error.")
         messagebox.showerror("Error durante la búsqueda", str(ex))
+
+    def _show_errors(self):
+        if not self._last_errors:
+            return
+        top = ctk.CTkToplevel(self)
+        top.title(f"Errores ({len(self._last_errors)})")
+        top.geometry("700x400")
+        textbox = ctk.CTkTextbox(top, wrap="word")
+        textbox.pack(fill="both", expand=True, padx=10, pady=10)
+        textbox.insert("1.0", "\n".join(self._last_errors))
+        textbox.configure(state="disabled")
+        top.transient(self)
+        top.focus()
 
     def _selected_path(self) -> str | None:
         sel = self.tree.selection()
@@ -390,11 +537,11 @@ class App(ctk.CTk):
         path = self._selected_path()
         if not path:
             return
-        folder = os.path.dirname(path)
+        target = path if os.path.isdir(path) else os.path.dirname(path)
         try:
-            os.startfile(folder)  # noqa: type: ignore[attr-defined]  (específico de Windows)
+            os.startfile(target)  # noqa: type: ignore[attr-defined]  (específico de Windows)
         except Exception as ex:
-            messagebox.showerror("No se pudo abrir la carpeta", str(ex))
+            messagebox.showerror("No se pudo abrir la ubicación", str(ex))
 
     def _copy_path(self):
         path = self._selected_path()
@@ -408,14 +555,15 @@ class App(ctk.CTk):
             {
                 "directory": self.dir_entry.get().strip(),
                 "pattern": self.pattern_entry.get(),
+                "target": self.target_var.get(),
                 "mode": self.mode_var.get(),
                 "case_sensitive": self.case_var.get(),
                 "oldest_first": self.oldest_var.get(),
                 "exclude": self.exclude_entry.get().strip(),
-                "ext": self.ext_entry.get().strip(),
+                "ext_groups": [g for g, v in self.ext_group_vars.items() if v.get()],
+                "ext_other_enabled": self.ext_other_var.get(),
+                "ext_other": self.ext_other_entry.get().strip(),
                 "threads": self.threads_entry.get().strip(),
-                "csv": self.csv_entry.get().strip(),
-                "log": self.log_entry.get().strip(),
             }
         )
 

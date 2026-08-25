@@ -39,6 +39,7 @@ class SearchOptions:
     exclude: Optional[str] = None
     ext: Optional[List[str]] = None
     oldest_first: bool = False
+    target: str = "files"  # "files" o "dirs" — mutuamente excluyentes
 
     def validate(self) -> None:
         """Lanza ValueError con un mensaje claro si la combinación de opciones
@@ -60,6 +61,8 @@ class SearchOptions:
                 re.compile(self.pattern)
             except re.error as ex:
                 raise ValueError(f"Patrón de expresión regular inválido: {ex}")
+        if self.target not in ("files", "dirs"):
+            raise ValueError('target debe ser "files" o "dirs".')
 
 
 @dataclass
@@ -148,6 +151,16 @@ def run_search(
                 if progress_cb:
                     progress_cb(files_now, dirs_now)
 
+    def _enqueue(path: str):
+        # put() con timeout en bucle: si se cancela mientras la cola está
+        # llena, no nos quedamos bloqueados esperando espacio para siempre.
+        while not cancel_event.is_set():
+            try:
+                q.put(path, timeout=0.2)
+                return
+            except queue.Full:
+                continue
+
     def walk():
         stack = [opts.directory]
         while stack and not cancel_event.is_set():
@@ -170,21 +183,21 @@ def run_search(
                             if entry.is_dir(follow_symlinks=False):
                                 if entry.name in excl:
                                     continue
+                                # Siempre se sigue recorriendo dentro de la carpeta
+                                # (para encontrar coincidencias anidadas), y además,
+                                # en modo "dirs", la carpeta misma es candidata a
+                                # coincidencia — se encola igual que un archivo.
                                 stack.append(entry.path)
+                                if opts.target == "dirs":
+                                    _enqueue(entry.path)
                             elif entry.is_file(follow_symlinks=False):
+                                if opts.target != "files":
+                                    continue
                                 if allowed_exts is not None:
                                     file_ext = os.path.splitext(entry.name)[1].lstrip(".").lower()
                                     if file_ext not in allowed_exts:
                                         continue
-                                # put() con timeout en bucle: si se cancela mientras
-                                # la cola está llena, no nos quedamos bloqueados
-                                # esperando espacio para siempre.
-                                while not cancel_event.is_set():
-                                    try:
-                                        q.put(entry.path, timeout=0.2)
-                                        break
-                                    except queue.Full:
-                                        continue
+                                _enqueue(entry.path)
                         except Exception as ex:
                             errors.append(f"Error procesando entrada en {entry.path}: {ex}")
             except Exception as ex:
