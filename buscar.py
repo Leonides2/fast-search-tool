@@ -71,7 +71,8 @@ def walk(root, q, args):
     y añade las rutas de los archivos encontrados a la cola para su procesamiento.
     """
     stack = [root]
-    excl = set(args.exclude or [])
+    excl = set(x.strip() for x in args.exclude.split(",") if x.strip()) if args.exclude else set()
+    print(f"Excluyendo carpetas: {excl}" if excl else "No se excluyen carpetas.")
     
     while stack:
         current_dir = stack.pop()
@@ -112,7 +113,7 @@ def main():
     ap.add_argument("--contains", action="store_true", help="El nombre debe contener el patrón en cualquier posición.")
     ap.add_argument("--regex", action="store_true", help="El patrón se interpreta como una expresión regular.")
     ap.add_argument("-c", "--case-sensitive", action="store_true", help="Búsqueda sensible a mayúsculas y minúsculas.")
-    ap.add_argument("--exclude", nargs="*", help="Lista de carpetas a excluir del recorrido.")
+    ap.add_argument("--exclude", help="Lista de carpetas a excluir, separadas por comas.")
     ap.add_argument("--ext", nargs="*", help="Lista de extensiones de archivo permitidas (ej. txt py csv).")
     ap.add_argument("--csv", default="resultados.csv", help="Ruta del archivo CSV de salida (por defecto: resultados.csv).")
     ap.add_argument("--log", default="resultados.log", help="Ruta del archivo de log de salida (por defecto: resultados.log).")
