@@ -15,3 +15,9 @@ venv/
 # Ignorar archivos de sistema y logs
 *.log
 *.csv
+
+# Ignorar artefactos de compilación de Nuitka (build.ps1)
+build/
+*.build/
+*.dist/
+*.onefile-build/

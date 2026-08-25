@@ -1,1 +1,2 @@
 tqdm>=4.66.0
+customtkinter>=6.0.0
