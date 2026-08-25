@@ -16,8 +16,11 @@ venv/
 *.log
 *.csv
 
-# Ignorar artefactos de compilación de Nuitka (build.ps1)
+# Ignorar artefactos de compilación de Nuitka (build.ps1 / build.py)
 build/
+dist/
 *.build/
 *.dist/
 *.onefile-build/
+/BuscarArchivos-*.zip
+/BuscarArchivos-*.tar.gz

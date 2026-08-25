@@ -1,0 +1,114 @@
+name: Release
+
+# Se dispara al empujar un tag de versión (ej. v1.2.3) — eso además crea el
+# Release en GitHub con los tres builds adjuntos. También se puede lanzar a
+# mano desde la pestaña Actions para solo probar que compila en los tres SO,
+# sin publicar nada (util para verificar Linux/macOS sin cortar un release).
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version a compilar (ej. 1.2.3) — solo se usa para nombrar los artefactos de esta prueba manual"
+        required: false
+        default: "0.0.0"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset_name: windows
+          - os: ubuntu-latest
+            asset_name: linux
+          - os: macos-latest
+            asset_name: macos
+    runs-on: ${{ matrix.os }}
+    # Windows es la plataforma que de verdad se usa y se probó a fondo; Linux
+    # y macOS son "best effort". Si alguna de las dos falla, no debe impedir
+    # que el release salga con el build de Windows.
+    continue-on-error: ${{ matrix.os != 'windows-latest' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-build.txt
+
+      - name: Verificar que tkinter está disponible
+        run: python -c "import tkinter; print('tkinter OK', tkinter.TkVersion)"
+
+      - name: Determinar versión
+        id: version
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ github.event.inputs.version }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Compilar con Nuitka
+        env:
+          BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: python build.py
+
+      - name: Empaquetar (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\BuscarArchivos -DestinationPath "BuscarArchivos-${{ steps.version.outputs.version }}-windows.zip"
+
+      - name: Empaquetar (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          tar -czf "BuscarArchivos-${{ steps.version.outputs.version }}-linux.tar.gz" -C dist BuscarArchivos
+
+      - name: Empaquetar (macOS)
+        if: matrix.os == 'macos-latest'
+        shell: bash
+        run: |
+          cd dist
+          zip -r "../BuscarArchivos-${{ steps.version.outputs.version }}-macos.zip" BuscarArchivos
+
+      - name: Subir artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: BuscarArchivos-${{ matrix.asset_name }}
+          path: BuscarArchivos-*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Crear release en GitHub
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar artefactos
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Crear release y adjuntar builds
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/BuscarArchivos-*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
